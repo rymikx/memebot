@@ -13,7 +13,10 @@ analyzer.py — сбор данных о мем-токене и расчёт и�
 
 import time
 import asyncio
+import logging
 import aiohttp
+
+logger = logging.getLogger(__name__)
 
 # Основной способ — поиск по тексту без привязки к конкретной сети.
 # Проверено по официальной документации DexScreener на июль 2026.
@@ -72,10 +75,26 @@ class AnalysisError(Exception):
 async def fetch_json(session: aiohttp.ClientSession, url: str, timeout: int = 10):
     try:
         async with session.get(url, timeout=timeout) as resp:
+            body_preview = None
             if resp.status != 200:
+                try:
+                    body_preview = (await resp.text())[:200]
+                except Exception:
+                    body_preview = "<не удалось прочитать тело ответа>"
+                logger.warning(
+                    "fetch_json: НЕ 200 статус %s для %s | тело: %s",
+                    resp.status, url, body_preview,
+                )
                 return None
-            return await resp.json()
-    except Exception:
+            data = await resp.json()
+            logger.info(
+                "fetch_json: OK (200) для %s | ключи ответа: %s",
+                url,
+                list(data.keys()) if isinstance(data, dict) else f"list[{len(data)}]",
+            )
+            return data
+    except Exception as e:
+        logger.warning("fetch_json: ИСКЛЮЧЕНИЕ при запросе %s: %r", url, e)
         return None
 
 
@@ -151,8 +170,15 @@ async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
     """
     pair = await _search_by_text(session, address)
     if pair:
+        logger.info("get_dexscreener_data: найдено через текстовый поиск: %s", address)
         return pair
-    return await _scan_all_chains(session, address)
+    logger.info("get_dexscreener_data: текстовый поиск ничего не дал для %s, пробую fallback по сетям", address)
+    result = await _scan_all_chains(session, address)
+    if result:
+        logger.info("get_dexscreener_data: найдено через fallback: %s (сеть %s)", address, result.get("chainId"))
+    else:
+        logger.warning("get_dexscreener_data: НЕ найдено нигде: %s", address)
+    return result
 
 
 async def get_goplus_security(session: aiohttp.ClientSession, chain_id_dexscreener: str, address: str):
@@ -391,4 +417,3 @@ async def analyze_token(address: str) -> dict:
             "final_score": final_score,
             "unavailable_count": sum(1 for v in components.values() if v[0] is None),
         }
- 
