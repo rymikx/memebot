@@ -72,30 +72,46 @@ class AnalysisError(Exception):
     pass
 
 
-async def fetch_json(session: aiohttp.ClientSession, url: str, timeout: int = 10):
-    try:
-        async with session.get(url, timeout=timeout) as resp:
-            body_preview = None
-            if resp.status != 200:
-                try:
-                    body_preview = (await resp.text())[:200]
-                except Exception:
-                    body_preview = "<не удалось прочитать тело ответа>"
-                logger.warning(
-                    "fetch_json: НЕ 200 статус %s для %s | тело: %s",
-                    resp.status, url, body_preview,
+async def fetch_json(session: aiohttp.ClientSession, url: str, timeout: int = 10, retries: int = 2):
+    """Делает GET-запрос и парсит JSON. При 429 (слишком много запросов)
+    делает паузу и повторяет — этого не было раньше, и именно поэтому бот
+    массово падал на 429, когда DexScreener банил пачку из 11 одновременных
+    запросов (это подтвердилось по логам с реальным адресом пользователя).
+    """
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status == 429:
+                    wait = 1.5 * (attempt + 1)
+                    logger.warning(
+                        "fetch_json: 429 (rate limit) для %s, попытка %d/%d, жду %.1fс",
+                        url, attempt + 1, retries + 1, wait,
+                    )
+                    if attempt < retries:
+                        await asyncio.sleep(wait)
+                        continue
+                    return None
+                if resp.status != 200:
+                    try:
+                        body_preview = (await resp.text())[:200]
+                    except Exception:
+                        body_preview = "<не удалось прочитать тело ответа>"
+                    logger.warning(
+                        "fetch_json: НЕ 200 статус %s для %s | тело: %s",
+                        resp.status, url, body_preview,
+                    )
+                    return None
+                data = await resp.json()
+                logger.info(
+                    "fetch_json: OK (200) для %s | ключи ответа: %s",
+                    url,
+                    list(data.keys()) if isinstance(data, dict) else f"list[{len(data)}]",
                 )
-                return None
-            data = await resp.json()
-            logger.info(
-                "fetch_json: OK (200) для %s | ключи ответа: %s",
-                url,
-                list(data.keys()) if isinstance(data, dict) else f"list[{len(data)}]",
-            )
-            return data
-    except Exception as e:
-        logger.warning("fetch_json: ИСКЛЮЧЕНИЕ при запросе %s: %r", url, e)
-        return None
+                return data
+        except Exception as e:
+            logger.warning("fetch_json: ИСКЛЮЧЕНИЕ при запросе %s: %r", url, e)
+            return None
+    return None
 
 
 def _addr_matches(candidate: str, address: str, is_evm: bool) -> bool:
@@ -144,11 +160,27 @@ async def _fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str, add
 
 
 async def _scan_all_chains(session: aiohttp.ClientSession, address: str):
-    """Запасной способ: опрашиваем каждую поддерживаемую сеть напрямую
-    и параллельно (быстрее, чем по очереди), берём лучшую найденную пару.
+    """Запасной способ: опрашиваем каждую поддерживаемую сеть напрямую.
+
+    Раньше все 11 запросов улетали строго одновременно (asyncio.gather без
+    ограничений) — по логам подтвердилось, что DexScreener банит такую
+    "залповую" пачку запросов с одного IP как подозрительную (429 на всё
+    сразу). Теперь ограничиваем не больше 3 запросов одновременно и
+    добавляем небольшую случайную задержку старта — это выглядит куда
+    менее похоже на скрейпер/атаку.
     """
+    semaphore = asyncio.Semaphore(3)
+
+    async def _bounded_fetch(chain: str, stagger_delay: float):
+        await asyncio.sleep(stagger_delay)
+        async with semaphore:
+            return await _fetch_pairs_for_chain(session, chain, address)
+
     results = await asyncio.gather(
-        *[_fetch_pairs_for_chain(session, chain, address) for chain in SUPPORTED_DEXSCREENER_CHAINS],
+        *[
+            _bounded_fetch(chain, i * 0.25)
+            for i, chain in enumerate(SUPPORTED_DEXSCREENER_CHAINS)
+        ],
         return_exceptions=True,
     )
     all_pairs = []
