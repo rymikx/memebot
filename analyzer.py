@@ -18,33 +18,14 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Основной способ — поиск по тексту без привязки к конкретной сети.
-# Проверено по официальной документации DexScreener на июль 2026.
-# Раньше использовался /latest/dex/tokens/{address} — DexScreener убрали его
-# из документации, поэтому старая версия бота перестала находить токены.
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q={address}"
-
-# Запасной способ — /latest/dex/search индексирует в первую очередь текстовые
-# запросы вида "SOL/USDC", а не гарантированно полные адреса контрактов.
-# Если поиск ничего не нашёл, опрашиваем этот эндпоинт напрямую по каждой
-# поддерживаемой сети — он принимает конкретный chainId и tokenAddress и
-# работает надёжно, если сеть угадана верно. Возвращает JSON-массив пар
-# напрямую (без обёртки {"pairs": [...]}), в отличие от /latest/dex/search.
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chain}/{address}"
 
-# Все сети, которые бот заявляет как поддерживаемые — именно в этом списке
-# chainId-слаги DexScreener (не путать с GoPlus chain_id из карты ниже).
 SUPPORTED_DEXSCREENER_CHAINS = [
     "ethereum", "bsc", "polygon", "arbitrum", "base", "avalanche",
     "optimism", "fantom", "robinhood", "solana", "ton",
 ]
 
-# chainId (DexScreener) -> chain_id (GoPlus, для EVM-сетей)
-# Примечание: "robinhood" (Robinhood Chain, chainId 4663, Arbitrum Orbit L2,
-# запущена 01.07.2026) добавлена сюда на всякий случай — GoPlus может ещё не
-# поддерживать такую молодую сеть. Если не поддерживает, get_goplus_security
-# просто вернёт None, и блок безопасности/держателей корректно уйдёт в N/A —
-# бот не упадёт и не соврёт о наличии данных.
 GOPLUS_EVM_CHAIN_MAP = {
     "ethereum": "1",
     "bsc": "56",
@@ -57,13 +38,6 @@ GOPLUS_EVM_CHAIN_MAP = {
     "robinhood": "4663",
 }
 
-# TON (The Open Network) — не EVM и не Solana, у GoPlus нет отдельного
-# эндпоинта для TON на момент написания бота. DexScreener данные (chainId
-# "ton") при этом доступны и обрабатываются как обычно. get_goplus_security
-# для chain_id_dexscreener == "ton" автоматически вернёт None (не найдётся
-# ни в GOPLUS_EVM_CHAIN_MAP, ни в ветке Solana) — контракт-секьюрити и
-# держатели будут честно помечены N/A, без сетевого вызова впустую.
-
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={address}"
 GOPLUS_SOLANA_URL = "https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={address}"
 
@@ -73,11 +47,6 @@ class AnalysisError(Exception):
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str, timeout: int = 10, retries: int = 2):
-    """Делает GET-запрос и парсит JSON. При 429 (слишком много запросов)
-    делает паузу и повторяет — этого не было раньше, и именно поэтому бот
-    массово падал на 429, когда DexScreener банил пачку из 11 одновременных
-    запросов (это подтвердилось по логам с реальным адресом пользователя).
-    """
     for attempt in range(retries + 1):
         try:
             async with session.get(url, timeout=timeout) as resp:
@@ -122,7 +91,7 @@ def _addr_matches(candidate: str, address: str, is_evm: bool) -> bool:
     return candidate == address
 
 
-def _pick_best_pair(pairs: list) -> dict | None:
+def _pick_best_pair(pairs):
     pairs = [p for p in pairs if p.get("liquidity", {}).get("usd") is not None]
     if not pairs:
         return None
@@ -130,12 +99,6 @@ def _pick_best_pair(pairs: list) -> dict | None:
 
 
 async def _search_by_text(session: aiohttp.ClientSession, address: str):
-    """Основной способ: /latest/dex/search?q=<адрес>.
-
-    Может не находить редкие/новые токены, если DexScreener не индексирует
-    полный адрес как текст поиска — тогда возвращает None, и вызывающий
-    код переходит к запасному способу (прямой опрос по сетям).
-    """
     data = await fetch_json(session, DEXSCREENER_SEARCH_URL.format(address=address))
     if not data or not data.get("pairs"):
         return None
@@ -150,16 +113,7 @@ async def _search_by_text(session: aiohttp.ClientSession, address: str):
     return _pick_best_pair(pairs)
 
 
-def _guess_candidate_chains(address: str) -> list:
-    """Определяем, какие сети реально имеет смысл проверять, по формату
-    адреса — вместо того чтобы долбить все 11 сетей подряд (именно это,
-    судя по логам, стабильно вызывало бан по 429 на общем IP Render).
-
-    - TON-адрес (EQ.../UQ... или 0:...) → только "ton"
-    - Solana-адрес (base58, без 0x) → только "solana"
-    - EVM-адрес (0x...) → пробуем самые популярные EVM-сети для мемов
-      по очереди (см. ниже), это тоже сильно меньше 11 запросов.
-    """
+def _guess_candidate_chains(address: str):
     is_ton = (
         (len(address) == 48 and address[:2] in ("EQ", "UQ", "kQ", "0Q"))
         or address.count(":") == 1 and address.split(":")[0].lstrip("-").isdigit()
@@ -169,31 +123,20 @@ def _guess_candidate_chains(address: str) -> list:
 
     is_evm = address.startswith("0x") or address.startswith("0X")
     if not is_evm:
-        # всё, что не TON и не 0x-адрес — считаем Solana (base58)
         return ["solana"]
 
-    # EVM: самые популярные для мемкоинов сначала
     return ["ethereum", "base", "bsc", "arbitrum", "robinhood", "polygon", "avalanche", "optimism", "fantom"]
 
 
 async def _fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str, address: str):
     url = DEXSCREENER_TOKEN_PAIRS_URL.format(chain=chain, address=address)
     data = await fetch_json(session, url)
-    # этот эндпоинт возвращает JSON-массив напрямую, а не {"pairs": [...]}
     if not data or not isinstance(data, list):
         return []
     return data
 
 
 async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str):
-    """Запасной способ: проверяем только те сети, где адрес реально может
-    существовать (по формату), а не все 11 подряд — резко меньше запросов
-    к DexScreener, что и вызывало устойчивый бан по 429 на общем IP.
-
-    Идём по очереди (не параллельно) и останавливаемся при первой находке —
-    для TON/Solana это всего 1 запрос, для EVM — максимум 9, но обычно
-    находится в первых 1-3 (Ethereum/Base/BSC — самые ходовые для мемов).
-    """
     candidates = _guess_candidate_chains(address)
     logger.info("Проверяю сети-кандидаты для %s: %s", address, candidates)
     for chain in candidates:
@@ -202,16 +145,9 @@ async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str):
         if best:
             return best
     return None
-    async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
-    """Возвращает лучшую (по ликвидности) торговую пару для адреса токена.
 
-    Сначала пробуем быстрый текстовый поиск (/latest/dex/search) — он не
-    требует знать сеть заранее, но может не находить некоторые токены,
-    если DexScreener не проиндексировал полный адрес как поисковый текст.
-    Если ничего не нашлось — идём по запасному пути: опрашиваем каждую
-    поддерживаемую сеть напрямую (/token-pairs/v1/{chain}/{address}),
-    это медленнее (несколько параллельных запросов), но надёжнее.
-    """
+
+async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
     pair = await _search_by_text(session, address)
     if pair:
         logger.info("get_dexscreener_data: найдено через текстовый поиск: %s", address)
@@ -226,7 +162,6 @@ async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str):
 
 
 async def get_goplus_security(session: aiohttp.ClientSession, chain_id_dexscreener: str, address: str):
-    """Возвращает сырой ответ GoPlus для EVM или Solana, либо None, если сеть не поддержана."""
     address_lower = address.lower()
     if chain_id_dexscreener == "solana":
         data = await fetch_json(session, GOPLUS_SOLANA_URL.format(address=address))
@@ -442,7 +377,6 @@ async def analyze_token(address: str) -> dict:
 
         available = [v[0] for v in components.values() if v[0] is not None]
         if available:
-            # нормируем к шкале 0-10 (каждый компонент максимум 2 балла)
             final_score = round(sum(available) / len(available) * 5, 1)
         else:
             final_score = None
