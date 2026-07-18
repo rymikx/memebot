@@ -1,22 +1,75 @@
 """
 analyzer.py — сбор данных о мем-токене и расчёт инвестиционного скора.
+
+Источники данных:
+- DexScreener API (без ключа) — ликвидность, объём, цена, возраст пары
+- GoPlus Security API (без ключа) — безопасность контракта, держатели
+
+Все внешние вызовы обёрнуты в try/except: если какой-то источник недоступен
+или не поддерживает сеть/токен — соответствующий блок скора помечается как
+"N/A" и исключается из финального расчёта (среднее считается по доступным
+блокам, а не по фиксированным 10 баллам).
 """
 
 import time
 import asyncio
 import logging
+import datetime
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# Основной способ — поиск по тексту без привязки к конкретной сети.
+# Проверено по официальной документации DexScreener на июль 2026.
+# Раньше использовался /latest/dex/tokens/{address} — DexScreener убрали его
+# из документации, поэтому старая версия бота перестала находить токены.
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q={address}"
+
+# Запасной способ — /latest/dex/search индексирует в первую очередь текстовые
+# запросы вида "SOL/USDC", а не гарантированно полные адреса контрактов.
+# Если поиск ничего не нашёл, опрашиваем этот эндпоинт напрямую по каждой
+# поддерживаемой сети — он принимает конкретный chainId и tokenAddress и
+# работает надёжно, если сеть угадана верно. Возвращает JSON-массив пар
+# напрямую (без обёртки {"pairs": [...]}), в отличие от /latest/dex/search.
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chain}/{address}"
 
+# Второй, независимый источник (от команды CoinGecko) — у него отдельная
+# инфраструктура, отдельный от DexScreener пул IP/серверов. Используем как
+# финальный запасной вариант, если DexScreener стабильно отвечает 429
+# (это бывает на бесплатном Render — общий IP "делится" с другими
+# бесплатными сервисами, и это вне нашего контроля со стороны кода).
+# Лимит ниже (30 запросов/мин), но нам за раз нужно 1-2 запроса — хватает.
+GECKOTERMINAL_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/{network}/tokens/{address}/pools"
+
+# Наши внутренние chain-слаги (совпадают с DexScreener) -> id сети в GeckoTerminal
+GECKOTERMINAL_NETWORK_MAP = {
+    "ethereum": "eth",
+    "bsc": "bsc",
+    "polygon": "polygon_pos",
+    "arbitrum": "arbitrum",
+    "base": "base",
+    "avalanche": "avax",
+    "optimism": "optimism",
+    "fantom": "ftm",
+    "solana": "solana",
+    "ton": "ton",
+    "robinhood": "robinhood",  # сеть очень новая — если GeckoTerminal ещё не
+    # добавил поддержку, запрос просто вернёт пусто/404, ничего не сломается
+}
+
+
+# chainId-слаги DexScreener (не путать с GoPlus chain_id из карты ниже).
 SUPPORTED_DEXSCREENER_CHAINS = [
     "ethereum", "bsc", "polygon", "arbitrum", "base", "avalanche",
     "optimism", "fantom", "robinhood", "solana", "ton",
 ]
 
+# chainId (DexScreener) -> chain_id (GoPlus, для EVM-сетей)
+# Примечание: "robinhood" (Robinhood Chain, chainId 4663, Arbitrum Orbit L2,
+# запущена 01.07.2026) добавлена сюда на всякий случай — GoPlus может ещё не
+# поддерживать такую молодую сеть. Если не поддерживает, get_goplus_security
+# просто вернёт None, и блок безопасности/держателей корректно уйдёт в N/A —
+# бот не упадёт и не соврёт о наличии данных.
 GOPLUS_EVM_CHAIN_MAP = {
     "ethereum": "1",
     "bsc": "56",
@@ -29,6 +82,13 @@ GOPLUS_EVM_CHAIN_MAP = {
     "robinhood": "4663",
 }
 
+# TON (The Open Network) — не EVM и не Solana, у GoPlus нет отдельного
+# эндпоинта для TON на момент написания бота. DexScreener данные (chainId
+# "ton") при этом доступны и обрабатываются как обычно. get_goplus_security
+# для chain_id_dexscreener == "ton" автоматически вернёт None (не найдётся
+# ни в GOPLUS_EVM_CHAIN_MAP, ни в ветке Solana) — контракт-секьюрити и
+# держатели будут честно помечены N/A, без сетевого вызова впустую.
+
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={address}"
 GOPLUS_SOLANA_URL = "https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={address}"
 
@@ -38,6 +98,11 @@ class AnalysisError(Exception):
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str, timeout: int = 10, retries: int = 2):
+    """Делает GET-запрос и парсит JSON. При 429 (слишком много запросов)
+    делает паузу и повторяет — этого не было раньше, и именно поэтому бот
+    массово падал на 429, когда DexScreener банил пачку из 11 одновременных
+    запросов (это подтвердилось по логам с реальным адресом пользователя).
+    """
     for attempt in range(retries + 1):
         try:
             async with session.get(url, timeout=timeout) as resp:
@@ -82,7 +147,7 @@ def _addr_matches(candidate: str, address: str, is_evm: bool) -> bool:
     return candidate == address
 
 
-def _pick_best_pair(pairs):
+def _pick_best_pair(pairs: list) -> dict | None:
     pairs = [p for p in pairs if p.get("liquidity", {}).get("usd") is not None]
     if not pairs:
         return None
@@ -90,6 +155,12 @@ def _pick_best_pair(pairs):
 
 
 async def _search_by_text(session: aiohttp.ClientSession, address: str):
+    """Основной способ: /latest/dex/search?q=<адрес>.
+
+    Может не находить редкие/новые токены, если DexScreener не индексирует
+    полный адрес как текст поиска — тогда возвращает None, и вызывающий
+    код переходит к запасному способу (прямой опрос по сетям).
+    """
     data = await fetch_json(session, DEXSCREENER_SEARCH_URL.format(address=address))
     if not data or not data.get("pairs"):
         return None
@@ -104,7 +175,13 @@ async def _search_by_text(session: aiohttp.ClientSession, address: str):
     return _pick_best_pair(pairs)
 
 
-def _confident_single_chain(address: str):
+def _confident_single_chain(address: str) -> str | None:
+    """Если по формату адреса сеть определяется однозначно (TON или Solana),
+    возвращаем её — тогда можно сразу идти в fallback, без траты запросов
+    на текстовый поиск, который для таких адресов, судя по логам, ни разу
+    не сработал (только тратил впустую 3 попытки и время на retry).
+    Для EVM-адресов (0x...) сеть неоднозначна — возвращаем None.
+    """
     is_ton = (
         (len(address) == 48 and address[:2] in ("EQ", "UQ", "kQ", "0Q"))
         or address.count(":") == 1 and address.split(":")[0].lstrip("-").isdigit()
@@ -117,22 +194,90 @@ def _confident_single_chain(address: str):
     return None
 
 
-def _guess_candidate_chains(address: str):
+def _guess_candidate_chains(address: str) -> list:
+    """Определяем, какие сети реально имеет смысл проверять, по формату
+    адреса — вместо того чтобы долбить все 11 сетей подряд (именно это,
+    судя по логам, стабильно вызывало бан по 429 на общем IP Render).
+    """
     confident = _confident_single_chain(address)
     if confident:
         return [confident]
+    # EVM: самые популярные для мемкоинов сначала
     return ["ethereum", "base", "bsc", "arbitrum", "robinhood", "polygon", "avalanche", "optimism", "fantom"]
 
 
 async def _fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str, address: str, retries: int = 2):
     url = DEXSCREENER_TOKEN_PAIRS_URL.format(chain=chain, address=address)
     data = await fetch_json(session, url, retries=retries)
+    # этот эндпоинт возвращает JSON-массив напрямую, а не {"pairs": [...]}
     if not data or not isinstance(data, list):
         return []
     return data
 
 
+def _geckoterminal_item_to_pair(item: dict, chain: str) -> dict:
+    """Приводит формат ответа GeckoTerminal к тому же виду dict, который
+    возвращает DexScreener (liquidity.usd, volume.h24, pairCreatedAt в мс,
+    fdv, priceChange.h24, chainId, ...) — чтобы все score_* функции ниже
+    работали одинаково независимо от того, откуда пришли данные.
+    """
+    attrs = item.get("attributes", {}) or {}
+
+    def _num(key, sub=None):
+        try:
+            v = attrs.get(key)
+            if sub and isinstance(v, dict):
+                v = v.get(sub)
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    created_ms = None
+    created_str = attrs.get("pool_created_at")
+    if created_str:
+        try:
+            dt = datetime.datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+            created_ms = dt.timestamp() * 1000
+        except Exception:
+            created_ms = None
+
+    name = attrs.get("name") or ""
+    symbol = name.split(" / ")[0].strip() if " / " in name else (name or None)
+
+    return {
+        "chainId": chain,
+        "dexId": "geckoterminal",
+        "baseToken": {"symbol": symbol, "name": symbol, "address": None},
+        "priceUsd": attrs.get("base_token_price_usd"),
+        "liquidity": {"usd": _num("reserve_in_usd")},
+        "volume": {"h24": _num("volume_usd", "h24")},
+        "pairCreatedAt": created_ms,
+        "fdv": _num("fdv_usd") or _num("market_cap_usd"),
+        "priceChange": {"h24": _num("price_change_percentage", "h24")},
+        "url": attrs.get("address") and f"https://www.geckoterminal.com/{chain}/pools/{attrs.get('address')}",
+    }
+
+
+async def _fetch_geckoterminal_pools(session: aiohttp.ClientSession, chain: str, address: str, retries: int = 2):
+    gt_network = GECKOTERMINAL_NETWORK_MAP.get(chain)
+    if not gt_network:
+        return []
+    url = GECKOTERMINAL_POOLS_URL.format(network=gt_network, address=address)
+    data = await fetch_json(session, url, retries=retries)
+    if not data or "data" not in data or not isinstance(data["data"], list):
+        return []
+    return [_geckoterminal_item_to_pair(item, chain) for item in data["data"]]
+
+
 async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str, retries_per_chain: int = 2):
+    """Запасной способ: проверяем только те сети, где адрес реально может
+    существовать (по формату), а не все 11 подряд — резко меньше запросов
+    к DexScreener, что и вызывало устойчивый бан по 429 на общем IP.
+
+    Идём по очереди (не параллельно) и останавливаемся при первой находке —
+    для TON/Solana это всего 1 сеть, для EVM — до 9, но обычно находится
+    в первых 1-3 (Ethereum/Base/BSC — самые ходовые для мемов).
+    """
     candidates = _guess_candidate_chains(address)
     logger.info("Проверяю сети-кандидаты для %s: %s", address, candidates)
     for chain in candidates:
@@ -144,7 +289,21 @@ async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str, r
 
 
 async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
+    """Возвращает лучшую (по ликвидности) торговую пару для адреса токена.
+
+    Порядок попыток:
+    1. Если сеть определяется однозначно по формату адреса (TON/Solana) —
+       сразу прямой запрос в DexScreener по этой сети, без траты запросов
+       на текстовый поиск.
+    2. Иначе (EVM) — сначала текстовый поиск DexScreener, потом перебор
+       популярных EVM-сетей напрямую.
+    3. Если DexScreener так и не ответил (стабильный 429 — известная
+       проблема на бесплатном Render, где IP общий с другими сервисами) —
+       пробуем GeckoTerminal: у него отдельная инфраструктура, отдельный
+       пул IP, так что шанс получить ответ там выше.
+    """
     confident_chain = _confident_single_chain(address)
+
     if confident_chain:
         logger.info(
             "get_dexscreener_data: сеть определена однозначно по формату (%s), "
@@ -152,26 +311,34 @@ async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
             confident_chain,
         )
         result = await _scan_candidate_chains(session, address, retries_per_chain=4)
+        chains_to_try_gt = [confident_chain]
+    else:
+        result = await _search_by_text(session, address)
         if result:
-            logger.info("get_dexscreener_data: найдено: %s (сеть %s)", address, result.get("chainId"))
-        else:
-            logger.warning("get_dexscreener_data: НЕ найдено нигде: %s", address)
+            logger.info("get_dexscreener_data: найдено через текстовый поиск: %s", address)
+            return result
+        logger.info("get_dexscreener_data: текстовый поиск ничего не дал для %s, пробую fallback по сетям", address)
+        result = await _scan_candidate_chains(session, address)
+        chains_to_try_gt = _guess_candidate_chains(address)
+
+    if result:
+        logger.info("get_dexscreener_data: найдено через DexScreener: %s (сеть %s)", address, result.get("chainId"))
         return result
 
-    pair = await _search_by_text(session, address)
-    if pair:
-        logger.info("get_dexscreener_data: найдено через текстовый поиск: %s", address)
-        return pair
-    logger.info("get_dexscreener_data: текстовый поиск ничего не дал для %s, пробую fallback по сетям", address)
-    result = await _scan_candidate_chains(session, address)
-    if result:
-        logger.info("get_dexscreener_data: найдено через fallback: %s (сеть %s)", address, result.get("chainId"))
-    else:
-        logger.warning("get_dexscreener_data: НЕ найдено нигде: %s", address)
-    return result
+    logger.warning("get_dexscreener_data: DexScreener не нашёл (%s), пробую GeckoTerminal как запасной источник", address)
+    for chain in chains_to_try_gt:
+        pairs = await _fetch_geckoterminal_pools(session, chain, address)
+        best = _pick_best_pair(pairs)
+        if best:
+            logger.info("get_dexscreener_data: найдено через GeckoTerminal: %s (сеть %s)", address, chain)
+            return best
+
+    logger.warning("get_dexscreener_data: НЕ найдено нигде (ни DexScreener, ни GeckoTerminal): %s", address)
+    return None
 
 
 async def get_goplus_security(session: aiohttp.ClientSession, chain_id_dexscreener: str, address: str):
+    """Возвращает сырой ответ GoPlus для EVM или Solana, либо None, если сеть не поддержана."""
     address_lower = address.lower()
     if chain_id_dexscreener == "solana":
         data = await fetch_json(session, GOPLUS_SOLANA_URL.format(address=address))
@@ -387,6 +554,7 @@ async def analyze_token(address: str) -> dict:
 
         available = [v[0] for v in components.values() if v[0] is not None]
         if available:
+            # нормируем к шкале 0-10 (каждый компонент максимум 2 балла)
             final_score = round(sum(available) / len(available) * 5, 1)
         else:
             final_score = None
