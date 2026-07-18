@@ -150,6 +150,32 @@ async def _search_by_text(session: aiohttp.ClientSession, address: str):
     return _pick_best_pair(pairs)
 
 
+def _guess_candidate_chains(address: str) -> list:
+    """Определяем, какие сети реально имеет смысл проверять, по формату
+    адреса — вместо того чтобы долбить все 11 сетей подряд (именно это,
+    судя по логам, стабильно вызывало бан по 429 на общем IP Render).
+
+    - TON-адрес (EQ.../UQ... или 0:...) → только "ton"
+    - Solana-адрес (base58, без 0x) → только "solana"
+    - EVM-адрес (0x...) → пробуем самые популярные EVM-сети для мемов
+      по очереди (см. ниже), это тоже сильно меньше 11 запросов.
+    """
+    is_ton = (
+        (len(address) == 48 and address[:2] in ("EQ", "UQ", "kQ", "0Q"))
+        or address.count(":") == 1 and address.split(":")[0].lstrip("-").isdigit()
+    )
+    if is_ton:
+        return ["ton"]
+
+    is_evm = address.startswith("0x") or address.startswith("0X")
+    if not is_evm:
+        # всё, что не TON и не 0x-адрес — считаем Solana (base58)
+        return ["solana"]
+
+    # EVM: самые популярные для мемкоинов сначала
+    return ["ethereum", "base", "bsc", "arbitrum", "robinhood", "polygon", "avalanche", "optimism", "fantom"]
+
+
 async def _fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str, address: str):
     url = DEXSCREENER_TOKEN_PAIRS_URL.format(chain=chain, address=address)
     data = await fetch_json(session, url)
@@ -159,38 +185,24 @@ async def _fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str, add
     return data
 
 
-async def _scan_all_chains(session: aiohttp.ClientSession, address: str):
-    """Запасной способ: опрашиваем каждую поддерживаемую сеть напрямую.
+async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str):
+    """Запасной способ: проверяем только те сети, где адрес реально может
+    существовать (по формату), а не все 11 подряд — резко меньше запросов
+    к DexScreener, что и вызывало устойчивый бан по 429 на общем IP.
 
-    Раньше все 11 запросов улетали строго одновременно (asyncio.gather без
-    ограничений) — по логам подтвердилось, что DexScreener банит такую
-    "залповую" пачку запросов с одного IP как подозрительную (429 на всё
-    сразу). Теперь ограничиваем не больше 3 запросов одновременно и
-    добавляем небольшую случайную задержку старта — это выглядит куда
-    менее похоже на скрейпер/атаку.
+    Идём по очереди (не параллельно) и останавливаемся при первой находке —
+    для TON/Solana это всего 1 запрос, для EVM — максимум 9, но обычно
+    находится в первых 1-3 (Ethereum/Base/BSC — самые ходовые для мемов).
     """
-    semaphore = asyncio.Semaphore(3)
-
-    async def _bounded_fetch(chain: str, stagger_delay: float):
-        await asyncio.sleep(stagger_delay)
-        async with semaphore:
-            return await _fetch_pairs_for_chain(session, chain, address)
-
-    results = await asyncio.gather(
-        *[
-            _bounded_fetch(chain, i * 0.25)
-            for i, chain in enumerate(SUPPORTED_DEXSCREENER_CHAINS)
-        ],
-        return_exceptions=True,
-    )
-    all_pairs = []
-    for r in results:
-        if isinstance(r, list):
-            all_pairs.extend(r)
-    return _pick_best_pair(all_pairs)
-
-
-async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
+    candidates = _guess_candidate_chains(address)
+    logger.info("Проверяю сети-кандидаты для %s: %s", address, candidates)
+    for chain in candidates:
+        pairs = await _fetch_pairs_for_chain(session, chain, address)
+        best = _pick_best_pair(pairs)
+        if best:
+            return best
+    return None
+    async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
     """Возвращает лучшую (по ликвидности) торговую пару для адреса токена.
 
     Сначала пробуем быстрый текстовый поиск (/latest/dex/search) — он не
@@ -205,7 +217,7 @@ async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
         logger.info("get_dexscreener_data: найдено через текстовый поиск: %s", address)
         return pair
     logger.info("get_dexscreener_data: текстовый поиск ничего не дал для %s, пробую fallback по сетям", address)
-    result = await _scan_all_chains(session, address)
+    result = await _scan_candidate_chains(session, address)
     if result:
         logger.info("get_dexscreener_data: найдено через fallback: %s (сеть %s)", address, result.get("chainId"))
     else:
