@@ -1,14 +1,5 @@
 """
 analyzer.py — сбор данных о мем-токене и расчёт инвестиционного скора.
-
-Источники данных:
-- DexScreener API (без ключа) — ликвидность, объём, цена, возраст пары
-- GoPlus Security API (без ключа) — безопасность контракта, держатели
-
-Все внешние вызовы обёрнуты в try/except: если какой-то источник недоступен
-или не поддерживает сеть/токен — соответствующий блок скора помечается как
-"N/A" и исключается из финального расчёта (среднее считается по доступным
-блокам, а не по фиксированным 10 баллам).
 """
 
 import time
@@ -113,34 +104,39 @@ async def _search_by_text(session: aiohttp.ClientSession, address: str):
     return _pick_best_pair(pairs)
 
 
-def _guess_candidate_chains(address: str):
+def _confident_single_chain(address: str):
     is_ton = (
         (len(address) == 48 and address[:2] in ("EQ", "UQ", "kQ", "0Q"))
         or address.count(":") == 1 and address.split(":")[0].lstrip("-").isdigit()
     )
     if is_ton:
-        return ["ton"]
-
+        return "ton"
     is_evm = address.startswith("0x") or address.startswith("0X")
     if not is_evm:
-        return ["solana"]
+        return "solana"
+    return None
 
+
+def _guess_candidate_chains(address: str):
+    confident = _confident_single_chain(address)
+    if confident:
+        return [confident]
     return ["ethereum", "base", "bsc", "arbitrum", "robinhood", "polygon", "avalanche", "optimism", "fantom"]
 
 
-async def _fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str, address: str):
+async def _fetch_pairs_for_chain(session: aiohttp.ClientSession, chain: str, address: str, retries: int = 2):
     url = DEXSCREENER_TOKEN_PAIRS_URL.format(chain=chain, address=address)
-    data = await fetch_json(session, url)
+    data = await fetch_json(session, url, retries=retries)
     if not data or not isinstance(data, list):
         return []
     return data
 
 
-async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str):
+async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str, retries_per_chain: int = 2):
     candidates = _guess_candidate_chains(address)
     logger.info("Проверяю сети-кандидаты для %s: %s", address, candidates)
     for chain in candidates:
-        pairs = await _fetch_pairs_for_chain(session, chain, address)
+        pairs = await _fetch_pairs_for_chain(session, chain, address, retries=retries_per_chain)
         best = _pick_best_pair(pairs)
         if best:
             return best
@@ -148,6 +144,20 @@ async def _scan_candidate_chains(session: aiohttp.ClientSession, address: str):
 
 
 async def get_dexscreener_data(session: aiohttp.ClientSession, address: str):
+    confident_chain = _confident_single_chain(address)
+    if confident_chain:
+        logger.info(
+            "get_dexscreener_data: сеть определена однозначно по формату (%s), "
+            "пропускаю текстовый поиск, иду сразу в fallback с доп. попытками",
+            confident_chain,
+        )
+        result = await _scan_candidate_chains(session, address, retries_per_chain=4)
+        if result:
+            logger.info("get_dexscreener_data: найдено: %s (сеть %s)", address, result.get("chainId"))
+        else:
+            logger.warning("get_dexscreener_data: НЕ найдено нигде: %s", address)
+        return result
+
     pair = await _search_by_text(session, address)
     if pair:
         logger.info("get_dexscreener_data: найдено через текстовый поиск: %s", address)
